@@ -143,7 +143,12 @@ export function applyJobResult(
     startedAt: number;
     endedAt: number;
   },
+  opts?: {
+    // Preserve recurring "every" anchors for manual force runs.
+    preserveSchedule?: boolean;
+  },
 ): boolean {
+  const prevLastRunAtMs = job.state.lastRunAtMs;
   job.state.runningAtMs = undefined;
   job.state.lastRunAtMs = result.startedAt;
   job.state.lastRunStatus = result.status;
@@ -188,7 +193,17 @@ export function applyJobResult(
     } else if (result.status === "error" && job.enabled) {
       // Apply exponential backoff for errored jobs to prevent retry storms.
       const backoff = errorBackoffMs(job.state.consecutiveErrors ?? 1);
-      const normalNext = computeJobNextRunAtMs(job, result.endedAt);
+      let normalNext: number | undefined;
+      if (opts?.preserveSchedule && job.schedule.kind === "every") {
+        job.state.lastRunAtMs = prevLastRunAtMs;
+        try {
+          normalNext = computeJobNextRunAtMs(job, result.endedAt);
+        } finally {
+          job.state.lastRunAtMs = result.startedAt;
+        }
+      } else {
+        normalNext = computeJobNextRunAtMs(job, result.endedAt);
+      }
       const backoffNext = result.endedAt + backoff;
       // Use whichever is later: the natural next run or the backoff delay.
       job.state.nextRunAtMs =
@@ -203,7 +218,17 @@ export function applyJobResult(
         "cron: applying error backoff",
       );
     } else if (job.enabled) {
-      const naturalNext = computeJobNextRunAtMs(job, result.endedAt);
+      let naturalNext: number | undefined;
+      if (opts?.preserveSchedule && job.schedule.kind === "every") {
+        job.state.lastRunAtMs = prevLastRunAtMs;
+        try {
+          naturalNext = computeJobNextRunAtMs(job, result.endedAt);
+        } finally {
+          job.state.lastRunAtMs = result.startedAt;
+        }
+      } else {
+        naturalNext = computeJobNextRunAtMs(job, result.endedAt);
+      }
       if (job.schedule.kind === "cron") {
         // Safety net: ensure the next fire is at least MIN_REFIRE_GAP_MS
         // after the current run ended.  Prevents spin-loops when the
@@ -324,13 +349,17 @@ export async function onTimer(state: CronServiceState) {
   try {
     const dueJobs = await locked(state, async () => {
       await ensureLoaded(state, { forceReload: true, skipRecompute: true });
-      const due = findDueJobs(state);
+      const dueCheckNow = state.deps.nowMs();
+      const due = collectRunnableJobs(state, dueCheckNow);
 
       if (due.length === 0) {
         // Use maintenance-only recompute to avoid advancing past-due nextRunAtMs
         // values without execution. This prevents jobs from being silently skipped
         // when the timer wakes up but findDueJobs returns empty (see #13992).
-        const changed = recomputeNextRunsForMaintenance(state);
+        const changed = recomputeNextRunsForMaintenance(state, {
+          recomputeExpired: true,
+          nowMs: dueCheckNow,
+        });
         if (changed) {
           await persist(state);
         }
@@ -454,14 +483,6 @@ export async function onTimer(state: CronServiceState) {
     state.running = false;
     armTimer(state);
   }
-}
-
-function findDueJobs(state: CronServiceState): CronJob[] {
-  if (!state.store) {
-    return [];
-  }
-  const now = state.deps.nowMs();
-  return collectRunnableJobs(state, now);
 }
 
 function isRunnableJob(params: {

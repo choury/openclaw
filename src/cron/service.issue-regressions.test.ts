@@ -9,7 +9,7 @@ import { CronService } from "./service.js";
 import { createDeferred, createRunningCronServiceState } from "./service.test-harness.js";
 import { computeJobNextRunAtMs } from "./service/jobs.js";
 import { createCronServiceState, type CronEvent } from "./service/state.js";
-import { executeJobCore, onTimer, runMissedJobs } from "./service/timer.js";
+import { applyJobResult, executeJobCore, onTimer, runMissedJobs } from "./service/timer.js";
 import type { CronJob, CronJobState } from "./types.js";
 
 const noopLogger = {
@@ -1144,5 +1144,42 @@ describe("Cron issue regressions", () => {
     const jobs = state.store?.jobs ?? [];
     expect(jobs.find((job) => job.id === first.id)?.state.lastStatus).toBe("ok");
     expect(jobs.find((job) => job.id === second.id)?.state.lastStatus).toBe("ok");
+  });
+
+  it("force run preserves 'every' anchor while recording manual lastRunAtMs", () => {
+    const nowMs = Date.now();
+    const everyMs = 24 * 60 * 60 * 1_000;
+    const lastScheduledRunMs = nowMs - 6 * 60 * 60 * 1_000;
+    const expectedNextMs = lastScheduledRunMs + everyMs;
+
+    const job: CronJob = {
+      id: "daily-job",
+      name: "Daily job",
+      enabled: true,
+      createdAtMs: lastScheduledRunMs - everyMs,
+      updatedAtMs: lastScheduledRunMs,
+      schedule: { kind: "every", everyMs, anchorMs: lastScheduledRunMs - everyMs },
+      sessionTarget: "main",
+      wakeMode: "next-heartbeat",
+      payload: { kind: "systemEvent", text: "daily check-in" },
+      state: {
+        lastRunAtMs: lastScheduledRunMs,
+        nextRunAtMs: expectedNextMs,
+      },
+    };
+    const state = createRunningCronServiceState({
+      storePath: "/tmp/cron-force-run-anchor-test.json",
+      log: noopLogger as never,
+      nowMs: () => nowMs,
+      jobs: [job],
+    });
+
+    const startedAt = nowMs;
+    const endedAt = nowMs + 2_000;
+
+    applyJobResult(state, job, { status: "ok", startedAt, endedAt }, { preserveSchedule: true });
+
+    expect(job.state.lastRunAtMs).toBe(startedAt);
+    expect(job.state.nextRunAtMs).toBe(expectedNextMs);
   });
 });
